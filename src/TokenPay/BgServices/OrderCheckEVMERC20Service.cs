@@ -1,7 +1,7 @@
 using Flurl;
 using Flurl.Http;
 using FreeSql;
-using Nethereum.Signer;
+using System.Numerics;
 using System.Threading.Channels;
 using TokenPay.Domains;
 using TokenPay.Extensions;
@@ -10,6 +10,9 @@ using TokenPay.Models.EthModel;
 
 namespace TokenPay.BgServices
 {
+    /// <summary>节点扫描得到的 BEP20 转账项，用于与待支付订单匹配</summary>
+    internal record NodeScanTransferItem(string Hash, string From, string To, decimal RealAmount, DateTime DateTime, long Confirmations, string ContractAddress);
+
     public class OrderCheckEVMERC20Service : BaseScheduledService
     {
         private readonly IConfiguration _configuration;
@@ -44,7 +47,10 @@ namespace TokenPay.BgServices
                     var Currency = $"EVM_{chain.ChainNameEN}_{erc20.Name}_{chain.ERC20Name}";
                     try
                     {
-                        await ERC20(_repository, Currency, chain, erc20);
+                        if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
+                            await ERC20ByNode(_repository, Currency, chain, erc20);
+                        else
+                            await ERC20(_repository, Currency, chain, erc20);
                     }
                     catch (Exception e)
                     {
@@ -55,10 +61,146 @@ namespace TokenPay.BgServices
             }
 
         }
+
+        private const string TransferTopic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        private const int NodeChunkBlocks = 300;
+        private const int NodeTotalBlocks = 2000;
+
         /// <summary>
-        /// 查询交易记录
+        /// BEP20 支付监控：用节点 RPC 分片查 Transfer，匹配待支付订单（猫头鹰等配置了 RpcUrl 的币种走此逻辑）
         /// </summary>
-        /// <returns></returns>
+        private async Task ERC20ByNode(IBaseRepository<TokenOrders> _repository, string Currency, EVMChain chain, EVMErc20 erc20)
+        {
+            var addresses = await _repository
+                .Where(x => x.Status == OrderStatus.Pending)
+                .Where(x => x.Currency == Currency)
+                .Distinct()
+                .ToListAsync(x => x.ToAddress);
+
+            if (addresses.Count == 0) return;
+
+            var rpc = chain.RpcUrl!.TrimEnd('/');
+            var decimals = erc20.Decimals > 0 ? erc20.Decimals : 18;
+
+            var blockHex = await RpcCall<string>(rpc, "eth_blockNumber", null);
+            if (string.IsNullOrEmpty(blockHex)) return;
+            var currentBlock = HexToLong(blockHex);
+
+            foreach (var address in addresses)
+            {
+                var orders = await _repository
+                    .Where(x => x.Status == OrderStatus.Pending)
+                    .Where(x => x.Currency == Currency)
+                    .Where(x => x.ToAddress == address)
+                    .OrderBy(x => x.CreateTime)
+                    .ToListAsync();
+                if (orders.Count == 0) continue;
+
+                var toTopic = "0x000000000000000000000000" + address.Replace("0x", "", StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
+                var allLogs = new List<EthLogEntry>();
+
+                for (var fromBlock = Math.Max(0, currentBlock - NodeTotalBlocks); fromBlock < currentBlock; fromBlock += NodeChunkBlocks)
+                {
+                    var toBlock = Math.Min(fromBlock + NodeChunkBlocks - 1, currentBlock);
+                    var getLogsFilter = new { address = erc20.ContractAddress, fromBlock = $"0x{fromBlock:x}", toBlock = $"0x{toBlock:x}", topics = new object?[] { TransferTopic0, null, toTopic } };
+                    var logs = await RpcCall<EthLogEntry[]>(rpc, "eth_getLogs", new object[] { getLogsFilter });
+                    if (logs != null && logs.Length > 0)
+                        allLogs.AddRange(logs);
+                }
+
+                if (allLogs.Count == 0) continue;
+
+                var blockNumbers = allLogs.Select(l => l.BlockNumber).Distinct().ToList();
+                var blockTimes = await GetBlockTimestamps(rpc, blockNumbers);
+
+                var items = new List<NodeScanTransferItem>();
+                foreach (var log in allLogs)
+                {
+                    if (log.Topics.Length < 3 || string.IsNullOrEmpty(log.Data)) continue;
+                    var from = "0x" + log.Topics[1].AsSpan(^40).ToString();
+                    var to = "0x" + log.Topics[2].AsSpan(^40).ToString();
+                    var valueWei = HexToBigInteger(log.Data);
+                    var realAmount = (decimal)(valueWei / (BigInteger)Math.Pow(10, decimals));
+                    var blockNum = HexToLong(log.BlockNumber);
+                    var confirmations = currentBlock - blockNum;
+                    var time = blockTimes.TryGetValue(log.BlockNumber, out var ts) ? ts : DateTime.UtcNow;
+                    items.Add(new NodeScanTransferItem(log.TransactionHash, from, to, realAmount, time, confirmations, log.Address));
+                }
+
+                foreach (var item in items.OrderByDescending(x => x.BlockNumber))
+                {
+                    if (orders.Count == 0) break;
+                    if (await _repository.Select.AnyAsync(x => x.BlockTransactionId == item.Hash)) continue;
+                    if (item.ContractAddress.Replace("0x", "", StringComparison.OrdinalIgnoreCase) != erc20.ContractAddress.Replace("0x", "", StringComparison.OrdinalIgnoreCase) || item.Confirmations < chain.Confirmations)
+                        continue;
+
+                    var order = orders.Where(x => x.Amount == item.RealAmount && x.ToAddress.Equals(item.To, StringComparison.OrdinalIgnoreCase) && x.CreateTime < item.DateTime)
+                        .OrderByDescending(x => x.CreateTime).FirstOrDefault();
+                recheck:
+                    if (order != null)
+                    {
+                        order.FromAddress = item.From;
+                        order.BlockTransactionId = item.Hash;
+                        order.Status = OrderStatus.Paid;
+                        order.PayTime = item.DateTime;
+                        order.PayAmount = item.RealAmount;
+                        await _repository.UpdateAsync(order);
+                        orders.Remove(order);
+                        await SendAdminMessage(order);
+                    }
+                    else if (UseDynamicAddress && UseDynamicAddressAmountMove)
+                    {
+                        var move = _configuration.GetSection($"DynamicAddressConfig:{erc20.Name}").Get<decimal[]>() ?? [];
+                        if (move.Length == 2)
+                        {
+                            order = orders.Where(x => item.RealAmount >= x.Amount - move[0] && item.RealAmount <= x.Amount + move[1])
+                                .Where(x => x.ToAddress.Equals(item.To, StringComparison.OrdinalIgnoreCase) && x.CreateTime < item.DateTime)
+                                .OrderByDescending(x => x.CreateTime).FirstOrDefault();
+                            if (order != null) { order.IsDynamicAmount = true; goto recheck; }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static async Task<Dictionary<string, DateTime>> GetBlockTimestamps(string rpc, List<string> blockNumbers)
+        {
+            var dict = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            foreach (var bn in blockNumbers)
+            {
+                var block = await RpcCall<EthBlock>(rpc, "eth_getBlockByNumber", new object[] { bn, false });
+                if (block?.Timestamp != null && long.TryParse(block.Timestamp.Replace("0x", ""), System.Globalization.NumberStyles.HexNumber, null, out var ts))
+                    dict[bn] = DateTimeOffset.FromUnixTimeSeconds(ts).UtcDateTime;
+            }
+            return dict;
+        }
+
+        private static async Task<T?> RpcCall<T>(string rpcUrl, string method, object?[]? parameters)
+        {
+            try
+            {
+                var req = new JsonRpcRequest { Id = 1, Method = method, Params = parameters };
+                var resp = await rpcUrl.WithTimeout(15).PostJsonAsync(req).ReceiveJson<JsonRpcResponse<T>>();
+                return resp.Error != null ? default : resp.Result;
+            }
+            catch { return default; }
+        }
+
+        private static long HexToLong(string hex)
+        {
+            if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) hex = hex[2..];
+            return long.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+        }
+
+        private static BigInteger HexToBigInteger(string hex)
+        {
+            if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) hex = hex[2..];
+            return BigInteger.Parse(hex, System.Globalization.NumberStyles.HexNumber);
+        }
+
+        /// <summary>
+        /// 查询交易记录（区块浏览器 API，未配置 RpcUrl 时使用）
+        /// </summary>
         private async Task ERC20(IBaseRepository<TokenOrders> _repository, string Currency, EVMChain chain, EVMErc20 erc20)
         {
             var Address = await _repository

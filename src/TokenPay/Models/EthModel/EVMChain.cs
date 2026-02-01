@@ -41,6 +41,10 @@ namespace TokenPay.Models.EthModel
         /// </summary>
         public string ApiKey { get; set; }
         /// <summary>
+        /// 节点 RPC 地址。配置后 BEP20 支付监控优先用节点分片查询（兼容 Ankr 等限区块范围）
+        /// </summary>
+        public string RpcUrl { get; set; }
+        /// <summary>
         /// 区块链id
         /// </summary>
         public int ChainId { get; set; }
@@ -63,6 +67,10 @@ namespace TokenPay.Models.EthModel
         /// 合约地址
         /// </summary>
         public string ContractAddress { get; set; }
+        /// <summary>
+        /// 代币精度（节点监控解析金额用，不填默认 18）
+        /// </summary>
+        public int Decimals { get; set; } = 18;
     }
 #pragma warning restore CS8618 // 在退出构造函数时，不可为 null 的字段必须包含非 null 值。请考虑声明为可以为 null。
 }

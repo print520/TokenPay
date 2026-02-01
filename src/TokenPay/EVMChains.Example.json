@@ -22,14 +22,15 @@
       ]
     },
     {
-      "Enable": false, // false 表示不启用此区块链， true 表示启用
+      "Enable": true, // false 表示不启用此区块链， true 表示启用
       "ChainName": "币安智能链",
       "ChainNameEN": "BSC",
       "BaseCoin": "BNB",
       "Decimals": 18,
       "ScanHost": "https://www.bscscan.com",
-      "ChainId": 56, //各个ETH系的ChainId可在此页面检索 https://docs.etherscan.io/etherscan-v2/supported-chains
-      "ApiKey": "必填项", // 使用ETH V2 Api，申请教程 https://docs.etherscan.io/etherscan-v2/getting-an-api-key
+      "ChainId": 56,
+      "RpcUrl": "https://rpc.ankr.com/bsc/f82044c375c79fe7f79323ce54f5a3243fa96bdf0c032d8cbb04998069a4b74d", // 配置后优先用节点分片查最新 BEP20 转账（每段 300 区块，共约 2000 区块），不填则用 ApiHost+ApiKey
+      "ApiKey": "f82044c375c79fe7f79323ce54f5a3243fa96bdf0c032d8cbb04998069a4b74d",
       "ERC20Name": "BEP20",
       "ERC20": [
         {
@@ -37,8 +38,8 @@
           "ContractAddress": "0x55d398326f99059ff775485246999027b3197955"
         },
         {
-          "Name": "USDC",
-          "ContractAddress": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+          "Name": "猫头鹰",
+          "ContractAddress": "0xaff848e2461d3306ab30ddb363e1a1db5ced7777"
         }
       ]
     },

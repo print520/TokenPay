@@ -67,6 +67,59 @@ namespace TokenPay.Controllers
             };
             return value;
         }
+
+        /// <summary>法币兑 USD：1 USD = X 法币。优先读配置；为 0 或未配置时从数据库取 USDT 对 BaseCurrency 的汇率（由定时任务从 OKX C2C 更新）</summary>
+        private async Task<decimal> GetBaseCurrencyToUsdAsync()
+        {
+            var fromConfig = _configuration.GetValue("BaseCurrencyToUsd", 0m);
+            if (fromConfig > 0)
+                return fromConfig;
+            var row = await _rateRepository.Where(x => x.Currency == "USDT" && x.FiatCurrency == BaseCurrency).FirstOrDefaultAsync();
+            return row?.Rate ?? 0;
+        }
+
+        /// <summary>从 EVMChains 获取该币种对应的合约地址，找不到返回 null</summary>
+        private string? GetErc20ContractAddress(string currency)
+        {
+            foreach (var chain in _chains)
+            {
+                if (chain?.ERC20 == null) continue;
+                foreach (var erc20 in chain.ERC20)
+                {
+                    var c = $"EVM_{chain.ChainNameEN}_{erc20.Name}_{chain.ERC20Name}";
+                    if (string.Equals(c, currency, StringComparison.OrdinalIgnoreCase))
+                        return erc20.ContractAddress;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 获取汇率（法币/代币）。猫头鹰等使用 DexScreener 的币种：rate = priceUsd × BaseCurrencyToUsd，订单应付数量 = 订单总额(法币) ÷ rate
+        /// </summary>
+        private async Task<decimal> GetRateAsync(string currency)
+        {
+            var fromConfig = GetRate(currency);
+            if (fromConfig > 0)
+                return fromConfig;
+
+            var contract = GetErc20ContractAddress(currency);
+            var dexContracts = _configuration.GetSection("DexScreener:ContractAddresses").Get<string[]>() ?? Array.Empty<string>();
+            if (!string.IsNullOrEmpty(contract) && dexContracts.Any(c => string.Equals(c?.Trim(), contract, StringComparison.OrdinalIgnoreCase)))
+            {
+                var priceUsd = await DexScreenerHelper.GetPriceUsdAsync(contract);
+                if (priceUsd > 0)
+                {
+                    var baseToUsd = await GetBaseCurrencyToUsdAsync();
+                    if (baseToUsd > 0)
+                        return priceUsd * baseToUsd;
+                }
+            }
+
+            var currencyName = currency.ToCurrency(_chains);
+            var row = await _rateRepository.Where(x => x.Currency == currencyName && x.FiatCurrency == BaseCurrency).FirstOrDefaultAsync();
+            return row?.Rate ?? 0;
+        }
         public static List<string> GetActiveCurrency(List<EVMChain> chains)
         {
             var list = new List<string>()
@@ -355,17 +408,10 @@ namespace TokenPay.Controllers
         private async Task<(string, decimal)> GetUseTokenDynamicAdress(CreateOrderViewModel model)
         {
             var (UseTokenAdress, _) = await CreateAddress(model.OrderUserKey, model.Currency);
-            var rate = GetRate(model.Currency);
+            var rate = await GetRateAsync(model.Currency);
             if (rate <= 0)
-            {
-                var Currency = model.Currency.ToCurrency(_chains);
-                rate = await _rateRepository.Where(x => x.Currency == Currency && x.FiatCurrency == BaseCurrency).FirstAsync(x => x.Rate);
-            }
-            if (rate <= 0)
-            {
                 throw new TokenPayException("汇率有误！");
-            }
-            var Amount = (model.ActualAmount / rate).ToRound(GetDecimals(model.Currency,_configuration)); //因为每个用户一个独立支付地址，所以此处金额计算逻辑与静态地址不同
+            var Amount = (model.ActualAmount / rate).ToRound(GetDecimals(model.Currency,_configuration));
             return (UseTokenAdress, Amount);
         }
         /// <summary>
@@ -445,16 +491,9 @@ namespace TokenPay.Controllers
             {
                 throw new TokenPayException("未配置收款地址！");
             }
-            var rate = GetRate(model.Currency);
+            var rate = await GetRateAsync(model.Currency);
             if (rate <= 0)
-            {
-                var Currency = model.Currency.ToCurrency(_chains);
-                rate = await _rateRepository.Where(x => x.Currency == Currency && x.FiatCurrency == BaseCurrency).FirstAsync(x => x.Rate);
-            }
-            if (rate <= 0)
-            {
                 throw new TokenPayException("汇率有误！");
-            }
             var Amount = (model.ActualAmount / rate).ToRound(GetDecimals(model.Currency, _configuration));
             //随机排序所有收款地址
             CurrentAdress = CurrentAdress.OrderBy(x => Guid.NewGuid()).ToArray();
