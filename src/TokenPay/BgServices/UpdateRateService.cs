@@ -46,8 +46,31 @@ namespace TokenPay.BgServices
             }
             return list;
         }
+        /// <summary>从配置和链信息得到“由 DexScreener 提供汇率”的币种名集合，这些不应走 OKX 更新。</summary>
+        private HashSet<string> GetDexScreenerCurrencyNames()
+        {
+            var dexContracts = _configuration.GetSection("DexScreener:ContractAddresses").Get<string[]>() ?? Array.Empty<string>();
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in dexContracts)
+            {
+                if (string.IsNullOrWhiteSpace(c)) continue;
+                var addr = c.Trim();
+                foreach (var chain in _chain)
+                {
+                    if (chain?.ERC20 == null) continue;
+                    foreach (var erc20 in chain.ERC20)
+                    {
+                        if (string.Equals(erc20.ContractAddress?.Trim(), addr, StringComparison.OrdinalIgnoreCase))
+                            set.Add(erc20.Name);
+                    }
+                }
+            }
+            return set;
+        }
+
         protected override async Task ExecuteAsync(DateTime RunTime, CancellationToken stoppingToken)
         {
+            var dexScreenerCurrencies = GetDexScreenerCurrencyNames();
             var baseCurrencyList = new List<string>();
             var erc20Names = _chain.Select(x => x.ERC20Name).ToArray();
             foreach (var _item in GetActiveCurrency())
@@ -60,6 +83,7 @@ namespace TokenPay.BgServices
                 var currency = item.Replace("TRC20", "").Split("_", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Last();
                 var rate = _configuration.GetValue($"Rate:{currency}", 0m);
                 if (rate > 0) continue;//无需更新汇率
+                if (dexScreenerCurrencies.Contains(currency)) continue;//猫头鹰等由 DexScreener 提供汇率，不向 OKX 请求
                 baseCurrencyList.Add(currency);
             }
             baseCurrencyList = baseCurrencyList.Distinct().ToList();
