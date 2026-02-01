@@ -22,6 +22,15 @@ namespace TokenPay.BgServices
         private readonly IFreeSql freeSql;
         private bool UseDynamicAddress => _configuration.GetValue("UseDynamicAddress", true);
         private bool UseDynamicAddressAmountMove => _configuration.GetValue("DynamicAddressConfig:AmountMove", false);
+
+        /// <summary>订单金额使用的小数位数（与创建订单时 ToRound 一致；匹配时对订单与链上金额都按此精度四舍五入再比较，避免 JSON/浮点误差）</summary>
+        private int GetOrderDecimals(string currency)
+        {
+            return currency == "TRX" ? _configuration.GetValue("Decimals:TRX", 2)
+                : currency == "EVM_ETH" ? _configuration.GetValue("Decimals:ETH", 5)
+                : _configuration.GetValue($"Decimals:{currency}", 4);
+        }
+
         public OrderCheckEVMERC20Service(ILogger<OrderCheckEVMERC20Service> logger,
             IConfiguration configuration,
             IHostEnvironment env,
@@ -253,6 +262,7 @@ namespace TokenPay.BgServices
 
                 _logger.LogInformation("OKLink 扫描 {Currency} 地址 {Address} 发现 {Count} 笔转入", Currency, address, incoming.Count);
                 var blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(0).UtcDateTime;
+                var orderDecimals = GetOrderDecimals(Currency);
 
                 foreach (var hit in incoming)
                 {
@@ -263,8 +273,9 @@ namespace TokenPay.BgServices
                     if (confirmations < chain.Confirmations) continue;
 
                     blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(hit.Blocktime).UtcDateTime;
+                    var hitAmountRounded = Math.Round(hit.RealValue, orderDecimals, MidpointRounding.AwayFromZero);
                     var order = orders
-                        .Where(x => x.Amount == hit.RealValue && x.CreateTime < blocktimeUtc)
+                        .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && x.CreateTime < blocktimeUtc)
                         .OrderByDescending(x => x.CreateTime)
                         .FirstOrDefault();
                 recheck:
@@ -286,13 +297,19 @@ namespace TokenPay.BgServices
                         if (move.Length == 2)
                         {
                             order = orders
-                                .Where(x => hit.RealValue >= x.Amount - move[0] && hit.RealValue <= x.Amount + move[1] && x.CreateTime < blocktimeUtc)
+                                .Where(x => hitAmountRounded >= x.Amount - move[0] && hitAmountRounded <= x.Amount + move[1] && x.CreateTime < blocktimeUtc)
                                 .OrderByDescending(x => x.CreateTime)
                                 .FirstOrDefault();
                             if (order != null) { order.IsDynamicAmount = true; goto recheck; }
                         }
                     }
                 }
+
+                if (orders.Count > 0 && incoming.Count > 0)
+                    _logger.LogWarning("OKLink 扫描 {Currency} 地址 {Address} 有 {InCount} 笔转入、{OrderCount} 笔待付订单但未匹配（小数位={Decimals}）。示例链上 realValue→四舍五入: {HitSample}，待匹配订单 Amount: {OrderSample}",
+                        Currency, address, incoming.Count, orders.Count, orderDecimals,
+                        string.Join("; ", incoming.Take(5).Select(h => $"{h.RealValue}→{Math.Round(h.RealValue, orderDecimals, MidpointRounding.AwayFromZero)}")),
+                        string.Join("; ", orders.Take(5).Select(o => o.Amount.ToString())));
             }
         }
 
