@@ -79,6 +79,8 @@ namespace TokenPay.BgServices
         private const string TransferTopic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
         private const int NodeChunkBlocks = 300;
         private const int NodeTotalBlocks = 2000;
+        /// <summary>订单创建时间与区块时间比较允许的偏差（秒）：订单 CreateTime 允许 &lt;= 区块时间 + 此值，避免服务器时钟略快于链上导致不匹配</summary>
+        private const int OrderBlockTimeToleranceSeconds = 120;
 
         /// <summary>
         /// BEP20 支付监控：用节点 RPC 分片查 Transfer，匹配待支付订单（猫头鹰等配置了 RpcUrl 的币种走此逻辑）
@@ -274,8 +276,9 @@ namespace TokenPay.BgServices
 
                     blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(hit.Blocktime).UtcDateTime;
                     var hitAmountRounded = Math.Round(hit.RealValue, orderDecimals, MidpointRounding.AwayFromZero);
+                    var blocktimeUtcMax = blocktimeUtc.AddSeconds(OrderBlockTimeToleranceSeconds);
                     var order = orders
-                        .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && x.CreateTime < blocktimeUtc)
+                        .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && x.CreateTime <= blocktimeUtcMax)
                         .OrderByDescending(x => x.CreateTime)
                         .FirstOrDefault();
                 recheck:
@@ -297,7 +300,7 @@ namespace TokenPay.BgServices
                         if (move.Length == 2)
                         {
                             order = orders
-                                .Where(x => hitAmountRounded >= x.Amount - move[0] && hitAmountRounded <= x.Amount + move[1] && x.CreateTime < blocktimeUtc)
+                                .Where(x => hitAmountRounded >= x.Amount - move[0] && hitAmountRounded <= x.Amount + move[1] && x.CreateTime <= blocktimeUtcMax)
                                 .OrderByDescending(x => x.CreateTime)
                                 .FirstOrDefault();
                             if (order != null) { order.IsDynamicAmount = true; goto recheck; }
