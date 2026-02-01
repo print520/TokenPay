@@ -207,14 +207,6 @@ namespace TokenPay.BgServices
                 .ToListAsync(x => x.ToAddress);
             if (addresses.Count == 0) return;
 
-            long currentBlock = 0;
-            if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
-            {
-                var blockHex = await RpcCall<string>(chain.RpcUrl!.TrimEnd('/'), "eth_blockNumber", null);
-                if (!string.IsNullOrEmpty(blockHex))
-                    currentBlock = HexToLong(blockHex);
-            }
-
             _logger.LogInformation("OKLink 扫描 {Currency} 收款地址数={Count}", Currency, addresses.Count);
             var contractAddrNorm = erc20.ContractAddress.Replace("0x", "", StringComparison.OrdinalIgnoreCase);
 
@@ -271,16 +263,18 @@ namespace TokenPay.BgServices
                     if (orders.Count == 0) break;
                     if (await _repository.Select.AnyAsync(x => x.BlockTransactionId == hit.TxHash)) continue;
 
-                    var confirmations = currentBlock > 0 ? currentBlock - hit.BlockHeight : 999;
-                    if (confirmations < chain.Confirmations) continue;
+                    var hitAmountRounded = Math.Round(hit.RealValue, orderDecimals, MidpointRounding.AwayFromZero);
+                    var hasMatchingAmount = orders.Any(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded);
 
                     blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(hit.Blocktime).UtcDateTime;
-                    var hitAmountRounded = Math.Round(hit.RealValue, orderDecimals, MidpointRounding.AwayFromZero);
                     var blocktimeUtcMax = blocktimeUtc.AddSeconds(OrderBlockTimeToleranceSeconds);
                     var order = orders
                         .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && x.CreateTime <= blocktimeUtcMax)
                         .OrderByDescending(x => x.CreateTime)
                         .FirstOrDefault();
+
+                    if (order == null && hasMatchingAmount)
+                        _logger.LogWarning("OKLink 有匹配金额的转入因时间条件不满足被跳过 金额={Amount} 区块时间(UTC)={BlockTime} 订单创建时间需<={MaxTime}（当前待付订单创建时间: {OrderTimes}）", hitAmountRounded, blocktimeUtc.ToString("yyyy-MM-dd HH:mm:ss"), blocktimeUtcMax.ToString("yyyy-MM-dd HH:mm:ss"), string.Join("; ", orders.Where(o => Math.Round(o.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded).Select(o => o.CreateTime.ToString("yyyy-MM-dd HH:mm:ss"))));
                 recheck:
                     if (order != null)
                     {
@@ -291,7 +285,7 @@ namespace TokenPay.BgServices
                         order.PayAmount = hit.RealValue;
                         await _repository.UpdateAsync(order);
                         orders.Remove(order);
-                        _logger.LogInformation("OKLink 扫描 {Currency} 订单已匹配 订单金额={Amount} 交易={Hash} 确认数={Confirmations}", Currency, hit.RealValue, hit.TxHash, confirmations);
+                        _logger.LogInformation("OKLink 扫描 {Currency} 订单已匹配 订单金额={Amount} 交易={Hash}", Currency, hit.RealValue, hit.TxHash);
                         await SendAdminMessage(order);
                     }
                     else if (UseDynamicAddress && UseDynamicAddressAmountMove)
@@ -309,7 +303,8 @@ namespace TokenPay.BgServices
                 }
 
                 if (orders.Count > 0 && incoming.Count > 0)
-                    _logger.LogWarning("OKLink 扫描 {Currency} 地址 {Address} 有 {InCount} 笔转入、{OrderCount} 笔待付订单但未匹配（小数位={Decimals}）。示例链上 realValue→四舍五入: {HitSample}，待匹配订单 Amount: {OrderSample}",
+                    _logger.LogWarning(
+                        "OKLink 扫描 {Currency} 地址 {Address} 有 {InCount} 笔转入、{OrderCount} 笔待付订单但未匹配（小数位={Decimals}）。示例链上 realValue→四舍五入: {HitSample}，待匹配订单 Amount: {OrderSample}。若金额一致仍不匹配，多为订单创建时间晚于区块时间+容差，请查看上一条「时间条件不满足」日志。",
                         Currency, address, incoming.Count, orders.Count, orderDecimals,
                         string.Join("; ", incoming.Take(5).Select(h => $"{h.RealValue}→{Math.Round(h.RealValue, orderDecimals, MidpointRounding.AwayFromZero)}")),
                         string.Join("; ", orders.Take(5).Select(o => o.Amount.ToString())));
