@@ -29,7 +29,7 @@
       "Decimals": 18,
       "ScanHost": "https://www.bscscan.com",
       "ChainId": 56,
-      "RpcUrl": "https://rpc.ankr.com/bsc/f82044c375c79fe7f79323ce54f5a3243fa96bdf0c032d8cbb04998069a4b74d", // 配置后优先用节点分片查最新 BEP20 转账（每段 300 区块，共约 2000 区块），不填则用 ApiHost+ApiKey
+      "RpcUrl": "", // 配置后优先用节点分片查最新 BEP20 转账（每段 300 区块，共约 2000 区块），不填则用 ApiHost+ApiKey
       "ApiKey": "f82044c375c79fe7f79323ce54f5a3243fa96bdf0c032d8cbb04998069a4b74d",
       "ERC20Name": "BEP20",
       "ERC20": [

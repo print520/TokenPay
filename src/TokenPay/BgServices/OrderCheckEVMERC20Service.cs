@@ -49,7 +49,10 @@ namespace TokenPay.BgServices
                     {
                         var pendingCount = await _repository.Where(x => x.Status == OrderStatus.Pending && x.Currency == Currency).CountAsync();
                         _logger.LogInformation("检查 {Currency} 待支付订单数={Count}", Currency, pendingCount);
-                        if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
+                        var okLinkKey = _configuration.GetValue<string>("OkLink:ApiKey");
+                        if (!string.IsNullOrWhiteSpace(okLinkKey) && chain.ChainId == 56)
+                            await ERC20ByOkLink(_repository, Currency, chain, erc20, okLinkKey);
+                        else if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
                             await ERC20ByNode(_repository, Currency, chain, erc20);
                         else
                             await ERC20(_repository, Currency, chain, erc20);
@@ -174,6 +177,118 @@ namespace TokenPay.BgServices
                             order = orders.Where(x => item.RealAmount >= x.Amount - move[0] && item.RealAmount <= x.Amount + move[1])
                                 .Where(x => x.ToAddress.Equals(item.To, StringComparison.OrdinalIgnoreCase) && x.CreateTime < item.DateTime)
                                 .OrderByDescending(x => x.CreateTime).FirstOrDefault();
+                            if (order != null) { order.IsDynamicAmount = true; goto recheck; }
+                        }
+                    }
+                }
+            }
+        }
+
+        private const string OkLinkBscTransfersUrl = "https://www.oklink.com/api/explorer/v2/bsc/addresses";
+
+        /// <summary>BSC 代币支付监控：用 OKLink 接口查地址代币转账，匹配待支付订单（配置 OkLink:ApiKey 时 BSC 走此逻辑）</summary>
+        private async Task ERC20ByOkLink(IBaseRepository<TokenOrders> _repository, string Currency, EVMChain chain, EVMErc20 erc20, string apiKey)
+        {
+            var addresses = await _repository
+                .Where(x => x.Status == OrderStatus.Pending)
+                .Where(x => x.Currency == Currency)
+                .Distinct()
+                .ToListAsync(x => x.ToAddress);
+            if (addresses.Count == 0) return;
+
+            long currentBlock = 0;
+            if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
+            {
+                var blockHex = await RpcCall<string>(chain.RpcUrl!.TrimEnd('/'), "eth_blockNumber", null);
+                if (!string.IsNullOrEmpty(blockHex))
+                    currentBlock = HexToLong(blockHex);
+            }
+
+            _logger.LogInformation("OKLink 扫描 {Currency} 收款地址数={Count}", Currency, addresses.Count);
+            var contractAddrNorm = erc20.ContractAddress.Replace("0x", "", StringComparison.OrdinalIgnoreCase);
+
+            foreach (var address in addresses)
+            {
+                var orders = await _repository
+                    .Where(x => x.Status == OrderStatus.Pending)
+                    .Where(x => x.Currency == Currency)
+                    .Where(x => x.ToAddress == address)
+                    .OrderBy(x => x.CreateTime)
+                    .ToListAsync();
+                if (orders.Count == 0) continue;
+
+                var url = $"{OkLinkBscTransfersUrl}/{address}/transfers/condition/token?t={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+                OkLinkTransfersResponse? resp;
+                try
+                {
+                    var xApiKey = OkLinkXApiKeyHelper.GetXApiKeyForRequest(apiKey);
+                    resp = await url
+                        .WithTimeout(15)
+                        .WithHeader("x-apikey", xApiKey)
+                        .WithHeader("content-type", "application/json")
+                        .WithHeader("accept", "application/json")
+                        .PostJsonAsync(new { offset = 0, address, nonzeroValue = true, limit = 50, tokenType = "BEP20" })
+                        .ReceiveJson<OkLinkTransfersResponse>();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("OKLink 请求失败 {Currency} 地址 {Address}: {Msg}", Currency, address, ex.Message);
+                    continue;
+                }
+
+                if (resp?.Code != 0 || resp.Data?.Hits == null || resp.Data.Hits.Count == 0)
+                {
+                    _logger.LogInformation("OKLink 扫描 {Currency} 地址 {Address} 无代币转账", Currency, address);
+                    continue;
+                }
+
+                var incoming = resp.Data.Hits
+                    .Where(h => h.RealValue > 0
+                        && string.Equals(h.TokenContractAddress.Replace("0x", "", StringComparison.OrdinalIgnoreCase), contractAddrNorm, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(h.To, address, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(h => h.BlockHeight)
+                    .ToList();
+
+                if (incoming.Count == 0) continue;
+
+                _logger.LogInformation("OKLink 扫描 {Currency} 地址 {Address} 发现 {Count} 笔转入", Currency, address, incoming.Count);
+                var blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(0).UtcDateTime;
+
+                foreach (var hit in incoming)
+                {
+                    if (orders.Count == 0) break;
+                    if (await _repository.Select.AnyAsync(x => x.BlockTransactionId == hit.TxHash)) continue;
+
+                    var confirmations = currentBlock > 0 ? currentBlock - hit.BlockHeight : 999;
+                    if (confirmations < chain.Confirmations) continue;
+
+                    blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(hit.Blocktime).UtcDateTime;
+                    var order = orders
+                        .Where(x => x.Amount == hit.RealValue && x.CreateTime < blocktimeUtc)
+                        .OrderByDescending(x => x.CreateTime)
+                        .FirstOrDefault();
+                recheck:
+                    if (order != null)
+                    {
+                        order.FromAddress = hit.From;
+                        order.BlockTransactionId = hit.TxHash;
+                        order.Status = OrderStatus.Paid;
+                        order.PayTime = blocktimeUtc;
+                        order.PayAmount = hit.RealValue;
+                        await _repository.UpdateAsync(order);
+                        orders.Remove(order);
+                        _logger.LogInformation("OKLink 扫描 {Currency} 订单已匹配 订单金额={Amount} 交易={Hash} 确认数={Confirmations}", Currency, hit.RealValue, hit.TxHash, confirmations);
+                        await SendAdminMessage(order);
+                    }
+                    else if (UseDynamicAddress && UseDynamicAddressAmountMove)
+                    {
+                        var move = _configuration.GetSection($"DynamicAddressConfig:{erc20.Name}").Get<decimal[]>() ?? [];
+                        if (move.Length == 2)
+                        {
+                            order = orders
+                                .Where(x => hit.RealValue >= x.Amount - move[0] && hit.RealValue <= x.Amount + move[1] && x.CreateTime < blocktimeUtc)
+                                .OrderByDescending(x => x.CreateTime)
+                                .FirstOrDefault();
                             if (order != null) { order.IsDynamicAmount = true; goto recheck; }
                         }
                     }
