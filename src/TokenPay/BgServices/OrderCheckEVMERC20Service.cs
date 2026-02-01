@@ -82,6 +82,14 @@ namespace TokenPay.BgServices
         /// <summary>订单创建时间与区块时间比较允许的偏差（秒）：订单 CreateTime 允许 &lt;= 区块时间 + 此值，避免服务器时钟略快于链上导致不匹配</summary>
         private const int OrderBlockTimeToleranceSeconds = 120;
 
+        /// <summary>将订单创建时间转为 UTC 再与链上区块时间比较。DB 读出的 CreateTime 多为 Unspecified，C# 与 Utc 比较时会当 UTC 导致中国时间被误判为“晚于”区块时间，此处按服务器本地时间转 UTC。</summary>
+        private static DateTime OrderCreateTimeToUtc(DateTime createTime)
+        {
+            if (createTime.Kind == DateTimeKind.Utc) return createTime;
+            if (createTime.Kind == DateTimeKind.Local) return createTime.ToUniversalTime();
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(createTime, DateTimeKind.Unspecified), TimeZoneInfo.Local);
+        }
+
         /// <summary>
         /// BEP20 支付监控：用节点 RPC 分片查 Transfer，匹配待支付订单（猫头鹰等配置了 RpcUrl 的币种走此逻辑）
         /// </summary>
@@ -269,12 +277,12 @@ namespace TokenPay.BgServices
                     blocktimeUtc = DateTimeOffset.FromUnixTimeSeconds(hit.Blocktime).UtcDateTime;
                     var blocktimeUtcMax = blocktimeUtc.AddSeconds(OrderBlockTimeToleranceSeconds);
                     var order = orders
-                        .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && x.CreateTime <= blocktimeUtcMax)
+                        .Where(x => Math.Round(x.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded && OrderCreateTimeToUtc(x.CreateTime) <= blocktimeUtcMax)
                         .OrderByDescending(x => x.CreateTime)
                         .FirstOrDefault();
 
                     if (order == null && hasMatchingAmount)
-                        _logger.LogWarning("OKLink 有匹配金额的转入因时间条件不满足被跳过 金额={Amount} 区块时间(UTC)={BlockTime} 订单创建时间需<={MaxTime}（当前待付订单创建时间: {OrderTimes}）", hitAmountRounded, blocktimeUtc.ToString("yyyy-MM-dd HH:mm:ss"), blocktimeUtcMax.ToString("yyyy-MM-dd HH:mm:ss"), string.Join("; ", orders.Where(o => Math.Round(o.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded).Select(o => o.CreateTime.ToString("yyyy-MM-dd HH:mm:ss"))));
+                        _logger.LogWarning("OKLink 有匹配金额的转入因时间条件不满足被跳过 金额={Amount} 区块时间(UTC)={BlockTime} 订单创建时间(UTC)需<={MaxTime}（当前待付订单创建时间 本地→UTC: {OrderTimes}）", hitAmountRounded, blocktimeUtc.ToString("yyyy-MM-dd HH:mm:ss"), blocktimeUtcMax.ToString("yyyy-MM-dd HH:mm:ss"), string.Join("; ", orders.Where(o => Math.Round(o.Amount, orderDecimals, MidpointRounding.AwayFromZero) == hitAmountRounded).Select(o => $"{o.CreateTime:yyyy-MM-dd HH:mm:ss}→{OrderCreateTimeToUtc(o.CreateTime):yyyy-MM-dd HH:mm:ss}")));
                 recheck:
                     if (order != null)
                     {
@@ -294,7 +302,7 @@ namespace TokenPay.BgServices
                         if (move.Length == 2)
                         {
                             order = orders
-                                .Where(x => hitAmountRounded >= x.Amount - move[0] && hitAmountRounded <= x.Amount + move[1] && x.CreateTime <= blocktimeUtcMax)
+                                .Where(x => hitAmountRounded >= x.Amount - move[0] && hitAmountRounded <= x.Amount + move[1] && OrderCreateTimeToUtc(x.CreateTime) <= blocktimeUtcMax)
                                 .OrderByDescending(x => x.CreateTime)
                                 .FirstOrDefault();
                             if (order != null) { order.IsDynamicAmount = true; goto recheck; }
