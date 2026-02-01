@@ -47,6 +47,8 @@ namespace TokenPay.BgServices
                     var Currency = $"EVM_{chain.ChainNameEN}_{erc20.Name}_{chain.ERC20Name}";
                     try
                     {
+                        var pendingCount = await _repository.Where(x => x.Status == OrderStatus.Pending && x.Currency == Currency).CountAsync();
+                        _logger.LogInformation("检查 {Currency} 待支付订单数={Count}", Currency, pendingCount);
                         if (!string.IsNullOrWhiteSpace(chain.RpcUrl))
                             await ERC20ByNode(_repository, Currency, chain, erc20);
                         else
@@ -77,14 +79,24 @@ namespace TokenPay.BgServices
                 .Distinct()
                 .ToListAsync(x => x.ToAddress);
 
-            if (addresses.Count == 0) return;
+            if (addresses.Count == 0)
+            {
+                _logger.LogDebug("节点扫描 {Currency} 无待支付订单，跳过", Currency);
+                return;
+            }
 
             var rpc = chain.RpcUrl!.TrimEnd('/');
             var decimals = erc20.Decimals > 0 ? erc20.Decimals : 18;
 
+            _logger.LogInformation("节点扫描 {Currency} 收款地址数={Count}", Currency, addresses.Count);
             var blockHex = await RpcCall<string>(rpc, "eth_blockNumber", null);
-            if (string.IsNullOrEmpty(blockHex)) return;
+            if (string.IsNullOrEmpty(blockHex))
+            {
+                _logger.LogWarning("节点扫描 {Currency} 获取区块高度失败，请检查 RpcUrl", Currency);
+                return;
+            }
             var currentBlock = HexToLong(blockHex);
+            _logger.LogInformation("节点扫描 {Currency} 当前区块={Block} 扫描最近{Blocks}区块", Currency, currentBlock, NodeTotalBlocks);
 
             foreach (var address in addresses)
             {
@@ -108,8 +120,13 @@ namespace TokenPay.BgServices
                         allLogs.AddRange(logs);
                 }
 
-                if (allLogs.Count == 0) continue;
+                if (allLogs.Count == 0)
+                {
+                    _logger.LogInformation("节点扫描 {Currency} 地址 {Address} 最近{Blocks}区块内无 Transfer", Currency, address, NodeTotalBlocks);
+                    continue;
+                }
 
+                _logger.LogInformation("节点扫描 {Currency} 地址 {Address} 发现 {Count} 笔 Transfer", Currency, address, allLogs.Count);
                 var blockNumbers = allLogs.Select(l => l.BlockNumber).Distinct().ToList();
                 var blockTimes = await GetBlockTimestamps(rpc, blockNumbers);
 
@@ -146,6 +163,7 @@ namespace TokenPay.BgServices
                         order.PayAmount = item.RealAmount;
                         await _repository.UpdateAsync(order);
                         orders.Remove(order);
+                        _logger.LogInformation("节点扫描 {Currency} 订单已匹配 订单金额={Amount} 交易={Hash} 确认数={Confirmations}", Currency, item.RealAmount, item.Hash, item.Confirmations);
                         await SendAdminMessage(order);
                     }
                     else if (UseDynamicAddress && UseDynamicAddressAmountMove)
