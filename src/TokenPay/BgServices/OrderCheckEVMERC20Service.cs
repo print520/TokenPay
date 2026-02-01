@@ -11,7 +11,7 @@ using TokenPay.Models.EthModel;
 namespace TokenPay.BgServices
 {
     /// <summary>节点扫描得到的 BEP20 转账项，用于与待支付订单匹配</summary>
-    internal record NodeScanTransferItem(string Hash, string From, string To, decimal RealAmount, DateTime DateTime, long Confirmations, string ContractAddress);
+    internal record NodeScanTransferItem(string Hash, string From, string To, decimal RealAmount, DateTime DateTime, long Confirmations, string ContractAddress, long BlockNumber);
 
     public class OrderCheckEVMERC20Service : BaseScheduledService
     {
@@ -124,10 +124,10 @@ namespace TokenPay.BgServices
                     var blockNum = HexToLong(log.BlockNumber);
                     var confirmations = currentBlock - blockNum;
                     var time = blockTimes.TryGetValue(log.BlockNumber, out var ts) ? ts : DateTime.UtcNow;
-                    items.Add(new NodeScanTransferItem(log.TransactionHash, from, to, realAmount, time, confirmations, log.Address));
+                    items.Add(new NodeScanTransferItem(log.TransactionHash, from, to, realAmount, time, confirmations, log.Address, blockNum));
                 }
 
-                foreach (var item in items.OrderByDescending(x => x.BlockNumber))
+                foreach (var item in items.OrderByDescending(x => x.BlockNumber).ToList())
                 {
                     if (orders.Count == 0) break;
                     if (await _repository.Select.AnyAsync(x => x.BlockTransactionId == item.Hash)) continue;

@@ -7,7 +7,7 @@ namespace TokenPay.Models.EthModel
         [JsonProperty("jsonrpc")] public string Jsonrpc { get; set; } = "2.0";
         [JsonProperty("id")] public int Id { get; set; }
         [JsonProperty("method")] public string Method { get; set; } = null!;
-        [JsonProperty("params")] public object[]? Params { get; set; }
+        [JsonProperty("params")] public object?[]? Params { get; set; }
     }
 
     public class JsonRpcResponse<T>

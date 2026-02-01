@@ -74,7 +74,8 @@ namespace TokenPay.Controllers
             var fromConfig = _configuration.GetValue("BaseCurrencyToUsd", 0m);
             if (fromConfig > 0)
                 return fromConfig;
-            var row = await _rateRepository.Where(x => x.Currency == "USDT" && x.FiatCurrency == BaseCurrency).FirstOrDefaultAsync();
+            var list = await _rateRepository.Where(x => x.Currency == "USDT" && x.FiatCurrency == BaseCurrency).Limit(1).ToListAsync();
+            var row = list.FirstOrDefault();
             return row?.Rate ?? 0;
         }
 
@@ -108,16 +109,17 @@ namespace TokenPay.Controllers
             if (!string.IsNullOrEmpty(contract) && dexContracts.Any(c => string.Equals(c?.Trim(), contract, StringComparison.OrdinalIgnoreCase)))
             {
                 var priceUsd = await DexScreenerHelper.GetPriceUsdAsync(contract);
-                if (priceUsd > 0)
+                if (priceUsd is > 0)
                 {
                     var baseToUsd = await GetBaseCurrencyToUsdAsync();
                     if (baseToUsd > 0)
-                        return priceUsd * baseToUsd;
+                        return (priceUsd ?? 0) * baseToUsd;
                 }
             }
 
             var currencyName = currency.ToCurrency(_chains);
-            var row = await _rateRepository.Where(x => x.Currency == currencyName && x.FiatCurrency == BaseCurrency).FirstOrDefaultAsync();
+            var list = await _rateRepository.Where(x => x.Currency == currencyName && x.FiatCurrency == BaseCurrency).Limit(1).ToListAsync();
+            var row = list.FirstOrDefault();
             return row?.Rate ?? 0;
         }
         public static List<string> GetActiveCurrency(List<EVMChain> chains)

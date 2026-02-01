@@ -22,7 +22,7 @@ namespace TokenPay.Helper
                 var resp = await BaseUrl
                     .AppendPathSegment(contractAddress.Trim())
                     .WithTimeout(10)
-                    .GetJsonAsync<DexScreenerResponse>(cancellationToken);
+                    .GetJsonAsync<DexScreenerResponse>();
                 var pair = resp?.Pairs?.FirstOrDefault();
                 if (pair == null || string.IsNullOrEmpty(pair.PriceUsd)) return null;
                 return decimal.TryParse(pair.PriceUsd, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var price) ? price : null;
