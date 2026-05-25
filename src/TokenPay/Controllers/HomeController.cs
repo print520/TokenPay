@@ -68,7 +68,7 @@ namespace TokenPay.Controllers
             return value;
         }
 
-        /// <summary>法币兑 USD：1 USD = X 法币。优先读配置；为 0 或未配置时从数据库取 USDT 对 BaseCurrency 的汇率（由定时任务从 OKX C2C 更新）</summary>
+        /// <summary>法币兑 USD：1 USD = X 法币。优先 BaseCurrencyToUsd；否则数据库 USDT 汇率；再否则使用 Rate:USDT 配置（DexScreener 币种依赖此项）</summary>
         private async Task<decimal> GetBaseCurrencyToUsdAsync()
         {
             var fromConfig = _configuration.GetValue("BaseCurrencyToUsd", 0m);
@@ -76,7 +76,25 @@ namespace TokenPay.Controllers
                 return fromConfig;
             var list = await _rateRepository.Where(x => x.Currency == "USDT" && x.FiatCurrency == BaseCurrency).Limit(1).ToListAsync();
             var row = list.FirstOrDefault();
-            return row?.Rate ?? 0;
+            if (row?.Rate > 0)
+                return row.Rate;
+            var configuredUsdt = GetRate("USDT_TRC20");
+            if (configuredUsdt > 0)
+                return configuredUsdt;
+            var fetched = await OkxRateHelper.FetchRateAsync("USDT", BaseCurrency);
+            if (fetched is > 0)
+            {
+                await _rateRepository.InsertOrUpdateAsync(new TokenRate
+                {
+                    Id = $"USDT_{BaseCurrency}",
+                    Currency = "USDT",
+                    FiatCurrency = BaseCurrency,
+                    LastUpdateTime = DateTime.Now,
+                    Rate = fetched.Value,
+                });
+                return fetched.Value;
+            }
+            return 0;
         }
 
         /// <summary>从 EVMChains 获取该币种对应的合约地址，找不到返回 null</summary>
@@ -120,7 +138,39 @@ namespace TokenPay.Controllers
             var currencyName = currency.ToCurrency(_chains);
             var list = await _rateRepository.Where(x => x.Currency == currencyName && x.FiatCurrency == BaseCurrency).Limit(1).ToListAsync();
             var row = list.FirstOrDefault();
-            return row?.Rate ?? 0;
+            if (row?.Rate > 0)
+                return row.Rate;
+
+            var fetchedRate = await OkxRateHelper.FetchRateAsync(currencyName, BaseCurrency);
+            if (fetchedRate is > 0)
+            {
+                var rateMove = _configuration.GetValue($"RateMove:{currencyName}_{BaseCurrency}", 0m).ToRound(2);
+                var finalRate = fetchedRate.Value + rateMove;
+                await _rateRepository.InsertOrUpdateAsync(new TokenRate
+                {
+                    Id = $"{currencyName}_{BaseCurrency}",
+                    Currency = currencyName,
+                    FiatCurrency = BaseCurrency,
+                    LastUpdateTime = DateTime.Now,
+                    Rate = finalRate,
+                });
+                return finalRate;
+            }
+            return 0;
+        }
+
+        private string BuildRateErrorMessage(string currency)
+        {
+            var currencyName = currency.ToCurrency(_chains);
+            var contract = GetErc20ContractAddress(currency);
+            var dexContracts = _configuration.GetSection("DexScreener:ContractAddresses").Get<string[]>() ?? Array.Empty<string>();
+            var usesDex = !string.IsNullOrEmpty(contract)
+                && dexContracts.Any(c => string.Equals(c?.Trim(), contract, StringComparison.OrdinalIgnoreCase));
+            if (usesDex)
+            {
+                return $"汇率有误！币种【{currency}】使用 DexScreener 定价，请检查：DexScreener 能否获取价格、BaseCurrencyToUsd 或 Rate:USDT 或数据库 USDT 汇率是否有效。";
+            }
+            return $"汇率有误！币种【{currency}】（{currencyName}）无法获取对 {BaseCurrency} 的汇率。请在 appsettings 配置 Rate:{currencyName}，或等待定时任务从 OKX 更新汇率（查看服务日志）。";
         }
         public static List<string> GetActiveCurrency(List<EVMChain> chains)
         {
@@ -412,7 +462,7 @@ namespace TokenPay.Controllers
             var (UseTokenAdress, _) = await CreateAddress(model.OrderUserKey, model.Currency);
             var rate = await GetRateAsync(model.Currency);
             if (rate <= 0)
-                throw new TokenPayException("汇率有误！");
+                throw new TokenPayException(BuildRateErrorMessage(model.Currency));
             var Amount = (model.ActualAmount / rate).ToRound(GetDecimals(model.Currency,_configuration));
             return (UseTokenAdress, Amount);
         }
@@ -495,7 +545,7 @@ namespace TokenPay.Controllers
             }
             var rate = await GetRateAsync(model.Currency);
             if (rate <= 0)
-                throw new TokenPayException("汇率有误！");
+                throw new TokenPayException(BuildRateErrorMessage(model.Currency));
             var Amount = (model.ActualAmount / rate).ToRound(GetDecimals(model.Currency, _configuration));
             //随机排序所有收款地址
             CurrentAdress = CurrentAdress.OrderBy(x => Guid.NewGuid()).ToArray();
